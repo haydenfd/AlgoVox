@@ -26,25 +26,3 @@ class Interviewer:
         reply = response.content[0].text
         self.history.append({"role": "assistant", "content": reply})
         return reply
-
-    def trim_history(self, max_turns: int = 20):
-        if len(self.history) > max_turns * 2:
-            self.history = self.history[-(max_turns * 2):]
-
-    def generate_report(self) -> str:
-        response = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=1000,
-            system="You are evaluating a mock technical interview.",
-            messages=self.history + [{
-                "role": "user",
-                "content": """Review this interview transcript and evaluate the candidate on:
-                1. Correctness of their approach
-                2. Time and space complexity analysis
-                3. Clarity of explanation
-                4. Edge cases identified vs missed
-                5. How they responded to hints
-                Give an overall summary and top 3 takeaways for improvement."""
-            }]
-        )
-        return response.content[0].text

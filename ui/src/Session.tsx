@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState, useEffect, useRef } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
 import Editor from "@monaco-editor/react";
 import { PauseCircle, PhoneOff, Bot, User, Play } from "lucide-react";
 
@@ -8,7 +8,31 @@ interface Message {
   text: string;
 }
 
-const STARTER_CODE = `# Problem: Two Sum [Easy]
+// const HARDCODED_MESSAGES: Message[] = [
+//   {
+//     speaker: "Interviewer",
+//     text: "Hi, welcome to your mock interview. Have you had a chance to read through the problem?",
+//   },
+//   {
+//     speaker: "You",
+//     text: "Yes I have. My approach would be to use a hashmap to store each number and its index.",
+//   },
+//   {
+//     speaker: "Interviewer",
+//     text: "Good start. Can you walk me through the time and space complexity of that approach?",
+//   },
+//   {
+//     speaker: "You",
+//     text: "Sure, it would be O(n) time and O(n) space.",
+//   },
+// ];
+
+type MicStatus = "listening" | "interviewer-speaking" | "processing";
+
+const Session = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const problemPrompt = location.state?.prompt ?? `# Problem: Two Sum [Easy]
 # Given an array of integers nums and an integer target,
 # return indices of the two numbers that add up to target.
 #
@@ -19,48 +43,32 @@ from typing import List
 class Solution:
     def twoSum(self, nums: List[int], target: int) -> List[int]:
         pass`;
-
-const HARDCODED_MESSAGES: Message[] = [
-  {
-    speaker: "Interviewer",
-    text: "Hi, welcome to your mock interview. Have you had a chance to read through the problem?",
-  },
-  {
-    speaker: "You",
-    text: "Yes I have. My approach would be to use a hashmap to store each number and its index.",
-  },
-  {
-    speaker: "Interviewer",
-    text: "Good start. Can you walk me through the time and space complexity of that approach?",
-  },
-  {
-    speaker: "You",
-    text: "Sure, it would be O(n) time and O(n) space.",
-  },
-];
-
-type MicStatus = "listening" | "interviewer-speaking" | "processing";
-
-const Session = () => {
-  const navigate = useNavigate();
-  const [code, setCode] = useState(STARTER_CODE);
+  const [code, setCode] = useState(problemPrompt);
   const [micStatus, setMicStatus] = useState<MicStatus>("listening");
   const [isPaused, setIsPaused] = useState(false);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const ws = useRef<WebSocket | null>(null);
 
-  // Cycle through mic statuses every 3 seconds (only when not paused)
+  // WebSocket connection
   useEffect(() => {
-    if (isPaused) return;
+    ws.current = new WebSocket("ws://127.0.0.1:8000/ws/transcribe");
 
-    const interval = setInterval(() => {
-      setMicStatus((prev) => {
-        if (prev === "listening") return "interviewer-speaking";
-        if (prev === "interviewer-speaking") return "processing";
-        return "listening";
-      });
-    }, 3000);
+    ws.current.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "status") {
+        setMicStatus(msg.value as MicStatus);
+      }
+      if (msg.type === "transcript") {
+        setMessages(prev => [...prev, { speaker: "You", text: msg.value }]);
+      }
+    };
 
-    return () => clearInterval(interval);
-  }, [isPaused]);
+    ws.current.onerror = (error) => {
+      console.error("WebSocket error:", error);
+    };
+
+    return () => ws.current?.close();
+  }, []);
 
   const handlePause = () => {
     setIsPaused(!isPaused);
@@ -142,7 +150,7 @@ const Session = () => {
         {/* Left Panel - Chat Transcript */}
         <div className="w-[30%] bg-[#252526] border-r border-[#3e3e42] flex flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-5 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-track]:bg-[#1e1e1e] [&::-webkit-scrollbar-thumb]:bg-[#3e3e42] [&::-webkit-scrollbar-thumb]:rounded [&::-webkit-scrollbar-thumb:hover]:bg-[#4e4e52]">
-            {HARDCODED_MESSAGES.map((message, index) => (
+            {messages.map((message, index) => (
               <div key={index} className="flex gap-3 animate-fadeIn">
                 <div
                   className={`shrink-0 w-8 h-8 rounded-full flex items-center justify-center mt-0.5 ${

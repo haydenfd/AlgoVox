@@ -8,9 +8,10 @@ import time
 SAMPLE_RATE = 16000          # 16kHz is what both VAD and Whisper expect
 FRAME_DURATION = 30          # ms per frame — webrtcvad supports 10, 20, or 30ms
 FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION / 1000)  # 480 samples per frame
-SILENCE_THRESHOLD = 45       # consecutive silent frames before stopping (~900ms)
-MAX_WAIT_TIME = 10           # seconds to wait for speech before giving up
-VAD_AGGRESSIVENESS = 2       # 0-3, higher = more aggressive noise filtering
+SILENCE_THRESHOLD = 25       # consecutive silent frames before stopping (~750ms)
+MIN_SPEECH_FRAMES = 10       # minimum frames of speech before considering it valid (~300ms)
+MAX_WAIT_TIME = 5            # seconds to wait for speech before giving up
+VAD_AGGRESSIVENESS = 3       # 0-3, higher = more aggressive noise filtering
 
 vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
 
@@ -24,6 +25,7 @@ def record() -> np.ndarray:
     print("Listening...")
     frames = []           # accumulated audio frames to transcribe
     silent_frames = 0     # counter for consecutive silent frames
+    speech_frames = 0     # counter for total speech frames detected
     started_speaking = False
     # pre_buffer holds the last ~300ms of audio before speech is detected
     # this prevents the first syllable from getting clipped
@@ -60,6 +62,7 @@ def record() -> np.ndarray:
                     # the audio just before speech was confirmed
                     frames.extend(pre_buffer)
                 started_speaking = True
+                speech_frames += 1
                 silent_frames = 0   # reset silence counter on speech
                 frames.append(frame)
 
@@ -70,8 +73,22 @@ def record() -> np.ndarray:
 
                 # enough consecutive silence — speaker is done
                 if silent_frames >= SILENCE_THRESHOLD:
-                    print("Done listening.")
-                    break
+                    # only process if we got enough speech (filter out brief noises)
+                    if speech_frames >= MIN_SPEECH_FRAMES:
+                        print("Done listening.")
+                        break
+                    else:
+                        # false alarm - reset and keep listening
+                        print("Too short, ignoring...")
+                        frames = []
+                        silent_frames = 0
+                        speech_frames = 0
+                        started_speaking = False
 
     # join all raw byte frames and interpret as int16 PCM audio
-    return np.frombuffer(b"".join(frames), dtype=np.int16)
+    # only return if we have enough speech (final check)
+    if speech_frames >= MIN_SPEECH_FRAMES:
+        return np.frombuffer(b"".join(frames), dtype=np.int16)
+    else:
+        print("Not enough speech detected.")
+        return np.array([], dtype=np.int16)

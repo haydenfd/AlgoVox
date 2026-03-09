@@ -1,3 +1,27 @@
 *.wav
 .env
 /src/__pycache__/
+*.onnx
+*.bin
+
+# UI (Tauri + React + Vite)
+ui/logs
+ui/*.log
+ui/npm-debug.log*
+ui/yarn-debug.log*
+ui/yarn-error.log*
+ui/pnpm-debug.log*
+ui/lerna-debug.log*
+ui/node_modules
+ui/dist
+ui/dist-ssr
+ui/*.local
+ui/.vscode/*
+!ui/.vscode/extensions.json
+ui/.idea
+ui/.DS_Store
+ui/*.suo
+ui/*.ntvs*
+ui/*.njsproj
+ui/*.sln
+ui/*.sw?

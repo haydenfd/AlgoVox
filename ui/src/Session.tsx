@@ -47,6 +47,7 @@ class Solution:
   const [micStatus, setMicStatus] = useState<MicStatus>("listening");
   const [isPaused, setIsPaused] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [timeRemaining, setTimeRemaining] = useState(30 * 60); // 30 minutes in seconds
   const ws = useRef<WebSocket | null>(null);
 
   // WebSocket connection
@@ -70,12 +71,29 @@ class Solution:
     return () => ws.current?.close();
   }, []);
 
+  // Timer countdown
+  useEffect(() => {
+    if (isPaused || timeRemaining <= 0) return;
+
+    const interval = setInterval(() => {
+      setTimeRemaining(prev => Math.max(0, prev - 1));
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isPaused, timeRemaining]);
+
   const handlePause = () => {
     setIsPaused(!isPaused);
   };
 
   const handleEndSession = () => {
     navigate("/home");
+  };
+
+  const formatTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
   const getMicStatusDisplay = () => {
@@ -125,8 +143,13 @@ class Solution:
       )}
 
       {/* Top Bar */}
-      <div className="flex justify-between items-center px-6 py-3 bg-[#252526] border-b border-[#3e3e42] h-14 shrink-0">
+      <div className="relative flex justify-between items-center px-6 py-3 bg-[#252526] border-b border-[#3e3e42] h-14 shrink-0">
         <div className="text-xl font-semibold text-white tracking-tight">AlgoVox</div>
+        <div className="absolute left-1/2 -translate-x-1/2 px-4 py-1.5 bg-[#1e1e1e] border border-[#3e3e42] rounded-lg">
+          <div className="text-lg font-mono text-white">
+            {formatTime(timeRemaining)}
+          </div>
+        </div>
         <div className="flex gap-3">
           <button
             className="flex items-center justify-center gap-2 px-4 py-2 bg-transparent border-none text-gray-300 cursor-pointer rounded-md text-sm font-medium hover:bg-[#3e3e42] hover:text-white transition-all"

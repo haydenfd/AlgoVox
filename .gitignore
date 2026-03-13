@@ -1,27 +1,34 @@
-*.wav
+# Environment
 .env
-/src/__pycache__/
-*.onnx
-*.bin
+.env.local
 
-# UI (Tauri + React + Vite)
-ui/logs
-ui/*.log
-ui/npm-debug.log*
-ui/yarn-debug.log*
-ui/yarn-error.log*
-ui/pnpm-debug.log*
-ui/lerna-debug.log*
-ui/node_modules
-ui/dist
-ui/dist-ssr
-ui/*.local
-ui/.vscode/*
-!ui/.vscode/extensions.json
-ui/.idea
-ui/.DS_Store
-ui/*.suo
-ui/*.ntvs*
-ui/*.njsproj
-ui/*.sln
-ui/*.sw?
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies
+node_modules
+
+# Build outputs
+dist
+dist-ssr
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/schemas

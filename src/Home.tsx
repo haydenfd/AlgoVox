@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { PlayCircle, FileText, User, Loader2, LogOut, X, Mic, Volume2 } from "lucide-react";
+import { PlayCircle, FileText, User, Loader2, LogOut, X, Mic, Volume2, MicOff, Play } from "lucide-react";
 import { useAuth } from "./AuthContext";
 import { invoke } from "@tauri-apps/api/core";
 // import { fetch } from "@tauri-apps/plugin-http";
@@ -89,6 +89,8 @@ const Home = () => {
   const [ttsLoading, setTtsLoading] = useState(false);
   const [ttsError, setTtsError] = useState("");
   const [ttsSuccess, setTtsSuccess] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordedAudio, setRecordedAudio] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isLoading && !user) {
@@ -157,6 +159,47 @@ const Home = () => {
       setTtsLoading(false);
     }
   };
+
+  const handleStartRecording = async () => {
+    console.log("🎤 Starting mic recording...");
+    try {
+      await invoke("start_recording");
+      setIsRecording(true);
+      console.log("✅ Recording started");
+    } catch (error) {
+      console.error("❌ Failed to start recording:", error);
+    }
+  };
+
+  const handleStopRecording = async () => {
+    console.log("🛑 Stopping mic recording...");
+    try {
+      const base64Audio = await invoke<string>("stop_recording");
+      setRecordedAudio(base64Audio);
+      setIsRecording(false);
+      console.log("✅ Recording stopped, audio saved");
+    } catch (error) {
+      console.error("❌ Failed to stop recording:", error);
+    }
+  };
+
+  const handlePlayRecording = () => {
+    if (!recordedAudio) return;
+
+    console.log("🎧 Playing recorded audio...");
+    const audioBytes = Uint8Array.from(atob(recordedAudio), c => c.charCodeAt(0));
+    const audioBlob = new Blob([audioBytes], { type: 'audio/wav' });
+    const audioUrl = URL.createObjectURL(audioBlob);
+
+    const audio = new Audio(audioUrl);
+    audio.play();
+
+    audio.onended = () => {
+      URL.revokeObjectURL(audioUrl);
+      console.log("🏁 Playback complete");
+    };
+  };
+
 
   const openLeetCodeLogin = () => {
     window.open("https://leetcode.com/accounts/login/", "_blank");
@@ -455,6 +498,52 @@ const Home = () => {
                     <p className="text-red-300 text-sm">{ttsError}</p>
                   </div>
                 )}
+              </div>
+
+              {/* Mic Test */}
+              <div className="mt-8 p-6 bg-[#13131f] border border-[#1a1a28] rounded-xl">
+                <h3 className="text-lg font-semibold text-white mb-4">Microphone Test</h3>
+
+                <div className="space-y-4">
+                  {/* Control Buttons */}
+                  <div className="flex gap-3">
+                    <button
+                      onClick={isRecording ? handleStopRecording : handleStartRecording}
+                      className={`flex items-center gap-2 px-6 py-3 rounded-lg text-sm font-semibold transition-all ${
+                        isRecording
+                          ? "bg-red-500 hover:bg-red-600 text-white"
+                          : "bg-[#7c6aff] hover:bg-[#6b59e6] text-white"
+                      }`}
+                    >
+                      {isRecording ? (
+                        <>
+                          <MicOff size={18} />
+                          <span>Stop Recording</span>
+                        </>
+                      ) : (
+                        <>
+                          <Mic size={18} />
+                          <span>Start Recording</span>
+                        </>
+                      )}
+                    </button>
+
+                    {recordedAudio && !isRecording && (
+                      <button
+                        onClick={handlePlayRecording}
+                        className="flex items-center gap-2 px-6 py-3 bg-green-500 hover:bg-green-600 text-white rounded-lg text-sm font-semibold transition-all"
+                      >
+                        <Play size={18} />
+                        <span>Play Recording</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Status */}
+                  <div className="text-sm text-gray-400">
+                    {isRecording ? "🔴 Recording..." : recordedAudio ? "✅ Recording saved - click Play to listen" : "⚪ No recording"}
+                  </div>
+                </div>
               </div>
             </section>
 

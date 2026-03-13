@@ -1,6 +1,9 @@
 use std::thread;
-use tauri::Emitter;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{Emitter, Manager};
 use serde::{Deserialize, Serialize};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 #[derive(Serialize)]
 struct DeepgramRequest {
@@ -30,11 +33,6 @@ struct DeepgramChannel {
 #[derive(Deserialize, Debug)]
 struct DeepgramAlternative {
     transcript: String,
-}
-
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
 #[tauri::command]
@@ -147,6 +145,177 @@ async fn test_tts() -> Result<String, String> {
     Ok(base64_audio)
 }
 
+// Global state for recording
+static RECORDING: AtomicBool = AtomicBool::new(false);
+lazy_static::lazy_static! {
+    static ref AUDIO_BUFFER: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    static ref SAMPLE_RATE: Arc<Mutex<u32>> = Arc::new(Mutex::new(44100));
+}
+
+#[tauri::command]
+async fn start_recording() -> Result<(), String> {
+    println!("🎤 [Rust] start_recording command invoked");
+
+    if RECORDING.load(Ordering::SeqCst) {
+        return Err("Already recording".to_string());
+    }
+
+    // Clear previous recording
+    {
+        let mut buffer = AUDIO_BUFFER.lock().unwrap();
+        buffer.clear();
+    }
+
+    RECORDING.store(true, Ordering::SeqCst);
+
+    thread::spawn(move || {
+        let host = cpal::default_host();
+        let device = match host.default_input_device() {
+            Some(d) => d,
+            None => {
+                eprintln!("🎤 [Rust] No input device available");
+                RECORDING.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        println!("🎤 [Rust] Using input device: {}", device.name().unwrap_or_default());
+
+        let config = match device.default_input_config() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("🎤 [Rust] Failed to get config: {}", e);
+                RECORDING.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        // Store sample rate
+        {
+            let mut sr = SAMPLE_RATE.lock().unwrap();
+            *sr = config.sample_rate().0;
+        }
+
+        println!("🎤 [Rust] Input config: {:?}", config);
+
+        let err_fn = |err| eprintln!("🎤 [Rust] Stream error: {}", err);
+
+        let buffer_clone = AUDIO_BUFFER.clone();
+
+        let stream = match config.sample_format() {
+            cpal::SampleFormat::F32 => device.build_input_stream(
+                &config.into(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    if !RECORDING.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let mut buffer = buffer_clone.lock().unwrap();
+                    buffer.extend_from_slice(data);
+                },
+                err_fn,
+                None,
+            ),
+            cpal::SampleFormat::I16 => device.build_input_stream(
+                &config.into(),
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    if !RECORDING.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let mut buffer = buffer_clone.lock().unwrap();
+                    // Convert i16 to f32
+                    for &sample in data {
+                        buffer.push(sample as f32 / i16::MAX as f32);
+                    }
+                },
+                err_fn,
+                None,
+            ),
+            _ => {
+                eprintln!("🎤 [Rust] Unsupported sample format");
+                RECORDING.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        match stream {
+            Ok(stream) => {
+                println!("🎤 [Rust] Starting audio stream...");
+                if let Err(e) = stream.play() {
+                    eprintln!("🎤 [Rust] Failed to play stream: {}", e);
+                    RECORDING.store(false, Ordering::SeqCst);
+                    return;
+                }
+
+                println!("✅ [Rust] Recording started");
+
+                // Keep stream alive while recording
+                while RECORDING.load(Ordering::SeqCst) {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                }
+
+                println!("🎤 [Rust] Stopping recording...");
+                drop(stream);
+                println!("✅ [Rust] Recording stopped");
+            }
+            Err(e) => {
+                eprintln!("🎤 [Rust] Failed to build input stream: {}", e);
+                RECORDING.store(false, Ordering::SeqCst);
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_recording() -> Result<String, String> {
+    println!("🛑 [Rust] stop_recording command invoked");
+    RECORDING.store(false, Ordering::SeqCst);
+
+    // Wait a bit for the stream to finish
+    thread::sleep(std::time::Duration::from_millis(200));
+
+    // Get the recorded audio
+    let buffer = AUDIO_BUFFER.lock().unwrap();
+    let sample_rate = *SAMPLE_RATE.lock().unwrap();
+
+    if buffer.is_empty() {
+        return Err("No audio recorded".to_string());
+    }
+
+    println!("🎵 [Rust] Encoding {} samples at {} Hz", buffer.len(), sample_rate);
+
+    // Encode to WAV
+    let mut wav_data = Vec::new();
+    {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let mut writer = hound::WavWriter::new(std::io::Cursor::new(&mut wav_data), spec)
+            .map_err(|e| format!("Failed to create WAV writer: {}", e))?;
+
+        for &sample in buffer.iter() {
+            let sample_i16 = (sample * i16::MAX as f32) as i16;
+            writer.write_sample(sample_i16)
+                .map_err(|e| format!("Failed to write sample: {}", e))?;
+        }
+
+        writer.finalize()
+            .map_err(|e| format!("Failed to finalize WAV: {}", e))?;
+    }
+
+    println!("✅ [Rust] WAV encoded: {} bytes", wav_data.len());
+
+    // Convert to base64
+    let base64_audio = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &wav_data);
+
+    Ok(base64_audio)
+}
+
 #[tauri::command]
 async fn start_oauth_listener(app_handle: tauri::AppHandle) -> Result<(), String> {
     thread::spawn(move || {
@@ -164,7 +333,7 @@ async fn start_oauth_listener(app_handle: tauri::AppHandle) -> Result<(), String
                 <html>
                 <head><title>Sign In Successful</title></head>
                 <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-                    <h1>✓ Sign in successful!</h1>
+                    <h1>Sign in successful!</h1>
                     <p>You can close this window and return to AlgoVox.</p>
                     <script>setTimeout(() => window.close(), 2000);</script>
                 </body>
@@ -189,7 +358,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_http::init())
-        .invoke_handler(tauri::generate_handler![greet, start_oauth_listener, test_stt, test_tts])
+        .invoke_handler(tauri::generate_handler![
+            start_oauth_listener,
+            test_stt,
+            test_tts,
+            start_recording,
+            stop_recording
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -6,13 +6,6 @@
   "permissions": [
     "core:default",
     "opener:default",
-    {
-      "identifier": "http:default",
-      "allow": [
-        {
-          "url": "https://leetcode.com/**"
-        }
-      ]
-    }
+    "shell:default"
   ]
 }

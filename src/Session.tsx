@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import Editor from "@monaco-editor/react";
 import { PauseCircle, PhoneOff, Bot, User, Play } from "lucide-react";
@@ -6,6 +6,17 @@ import { PauseCircle, PhoneOff, Bot, User, Play } from "lucide-react";
 interface Message {
   speaker: "Interviewer" | "You";
   text: string;
+}
+
+interface Question {
+  id: number;
+  title: string;
+  difficulty: "Easy" | "Medium" | "Hard";
+  category: string;
+  leetcode_url?: string;
+  leetcode_slug?: string;
+  prompt: string;
+  created_at?: string;
 }
 
 // const HARDCODED_MESSAGES: Message[] = [
@@ -32,7 +43,10 @@ type MicStatus = "listening" | "interviewer-speaking" | "processing";
 const Session = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const problemPrompt = location.state?.prompt ?? `# Problem: Two Sum [Easy]
+  const question: Question | undefined = location.state?.question;
+
+  // Fallback to default problem if no question passed
+  const defaultPrompt = `# Problem: Two Sum [Easy]
 # Given an array of integers nums and an integer target,
 # return indices of the two numbers that add up to target.
 #
@@ -43,33 +57,29 @@ from typing import List
 class Solution:
     def twoSum(self, nums: List[int], target: int) -> List[int]:
         pass`;
-  const [code, setCode] = useState(problemPrompt);
+
+  // Format prompt as Python comments
+  const formatPromptAsComments = (prompt: string): string => {
+    // Split by lines and add # prefix to each line
+    const lines = prompt.split('\n');
+    const commentedLines = lines.map(line => line.trim() ? `# ${line}` : '#');
+    return commentedLines.join('\n') + '\n\n';
+  };
+
+  const initialCode = question?.prompt
+    ? formatPromptAsComments(question.prompt)
+    : defaultPrompt;
+
+  const [code, setCode] = useState(initialCode);
   const [micStatus, setMicStatus] = useState<MicStatus>("listening");
   const [isPaused, setIsPaused] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [timeRemaining, setTimeRemaining] = useState(30 * 60); // 30 minutes in seconds
-  const ws = useRef<WebSocket | null>(null);
 
-  // WebSocket connection
-  useEffect(() => {
-    ws.current = new WebSocket("ws://127.0.0.1:8000/ws/transcribe");
+  // Store question for later use (e.g., saving session)
+  console.log("Current question:", question);
 
-    ws.current.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      if (msg.type === "status") {
-        setMicStatus(msg.value as MicStatus);
-      }
-      if (msg.type === "transcript") {
-        setMessages(prev => [...prev, { speaker: "You", text: msg.value }]);
-      }
-    };
-
-    ws.current.onerror = (error) => {
-      console.error("WebSocket error:", error);
-    };
-
-    return () => ws.current?.close();
-  }, []);
+  // WebSocket/transcription removed for now - will be added later
 
   // Timer countdown
   useEffect(() => {

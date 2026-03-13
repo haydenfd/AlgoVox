@@ -1,21 +1,18 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { handleOAuthCallback } from "./oauth";
+import { supabase } from "./supabase";
+import type { User as SupabaseUser } from "@supabase/supabase-js";
 
 interface User {
   id: string;
   email: string;
   name: string;
   avatar_url?: string;
-  provider: string;
-  access_token: string;
 }
 
 interface AuthContextType {
   user: User | null;
-  login: (user: User) => void;
-  logout: () => void;
+  logout: () => Promise<void>;
   isLoading: boolean;
 }
 
@@ -39,68 +36,54 @@ export const AuthProvider = ({ children }: AuthProviderProps) => {
   const navigate = useNavigate();
 
   useEffect(() => {
-    // Load stored user session
-    const storedUser = localStorage.getItem("auth_user");
+    // Check active session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user) {
+        setUser(mapSupabaseUser(session.user));
+      }
+      setIsLoading(false);
+    });
 
-    if (storedUser) {
-      setUser(JSON.parse(storedUser));
-    }
+    // Listen for auth changes
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_IN' && session?.user) {
+        setUser(mapSupabaseUser(session.user));
+        navigate("/home");
+      } else if (event === 'SIGNED_OUT') {
+        setUser(null);
+        navigate("/");
+      } else if (session?.user) {
+        // Update user data without redirecting
+        setUser(mapSupabaseUser(session.user));
+      } else {
+        setUser(null);
+      }
+    });
 
-    setIsLoading(false);
-
-    // Listen for OAuth callback from local server
-    const setupOAuthListener = async () => {
-      const { listen } = await import("@tauri-apps/api/event");
-
-      console.log("Setting up OAuth listener...");
-
-      const unlisten = await listen<string>("oauth-callback", async (event) => {
-        console.log("OAuth callback event received!", event);
-        const callbackUrl = event.payload;
-        console.log("Callback URL:", callbackUrl);
-
-        try {
-          // Construct full URL for parsing
-          const fullUrl = `http://127.0.0.1:8080${callbackUrl}`;
-          console.log("Processing full URL:", fullUrl);
-          const userInfo = await handleOAuthCallback(fullUrl);
-          console.log("User info received:", userInfo);
-          login(userInfo);
-          navigate("/home");
-        } catch (error) {
-          console.error("OAuth callback error:", error);
-          alert(`Authentication failed: ${error instanceof Error ? error.message : "Unknown error"}`);
-          navigate("/");
-        }
-      });
-
-      console.log("OAuth listener set up successfully");
-      return unlisten;
-    };
-
-    let unlistenPromise = setupOAuthListener();
-
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
+    return () => subscription.unsubscribe();
   }, [navigate]);
 
-  const login = (newUser: User) => {
-    setUser(newUser);
-    localStorage.setItem("auth_user", JSON.stringify(newUser));
-  };
-
-  const logout = () => {
+  const logout = async () => {
+    await supabase.auth.signOut();
     setUser(null);
-    localStorage.removeItem("auth_user");
   };
 
   const value = {
     user,
-    login,
     logout,
     isLoading,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
+
+function mapSupabaseUser(supabaseUser: SupabaseUser): User {
+  return {
+    id: supabaseUser.id,
+    email: supabaseUser.email || "",
+    name: supabaseUser.user_metadata?.full_name || supabaseUser.email || "User",
+    avatar_url: supabaseUser.user_metadata?.avatar_url,
+  };
+}

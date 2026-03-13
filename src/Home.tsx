@@ -1,68 +1,23 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { PlayCircle, FileText, User, Loader2, LogOut, X, Mic, Volume2, MicOff, Play } from "lucide-react";
+import { PlayCircle, FileText, User, Loader2, LogOut, X, Mic, Volume2, MicOff } from "lucide-react";
 import { useAuth } from "./AuthContext";
 import { invoke } from "@tauri-apps/api/core";
-// import { fetch } from "@tauri-apps/plugin-http";
+import { listen } from "@tauri-apps/api/event";
+import { supabase } from "./supabase";
 
-type NavItem = "practice" | "transcripts"; 
+type NavItem = "practice" | "transcripts";
 
 interface Problem {
   id: number;
-  name: string;
+  title: string;
   difficulty: "Easy" | "Medium" | "Hard";
-  tags: string[];
+  category: string;
+  leetcode_url?: string;
+  leetcode_slug?: string;
   prompt: string;
+  created_at?: string;
 }
-
-const PROBLEMS: Problem[] = [
-  {
-    id: 1,
-    name: "Two Sum",
-    difficulty: "Easy",
-    tags: ["Array", "Hash Table"],
-    prompt: `# Problem: Two Sum [Easy]
-# Given an array of integers nums and an integer target,
-# return indices of the two numbers that add up to target.
-# You may assume each input has exactly one solution.
-#
-# Example: nums = [2,7,11,15], target = 9 → [0,1]`,
-  },
-  {
-    id: 2,
-    name: "Valid Parentheses",
-    difficulty: "Easy",
-    tags: ["Stack", "String"],
-    prompt: `# Problem: Valid Parentheses [Easy]
-# Given a string s containing just '(', ')', '{', '}', '[' and ']',
-# determine if the input string is valid.
-#
-# Example: s = "()[]{}" → true, s = "(]" → false`,
-  },
-  {
-    id: 3,
-    name: "Climbing Stairs",
-    difficulty: "Easy",
-    tags: ["Dynamic Programming"],
-    prompt: `# Problem: Climbing Stairs [Easy]
-# You are climbing a staircase with n steps.
-# Each time you can climb 1 or 2 steps.
-# In how many distinct ways can you climb to the top?
-#
-# Example: n = 3 → 3 (1+1+1, 1+2, 2+1)`,
-  },
-  {
-    id: 4,
-    name: "Best Time to Buy and Sell Stock",
-    difficulty: "Easy",
-    tags: ["Array", "Greedy"],
-    prompt: `# Problem: Best Time to Buy and Sell Stock [Easy]
-# Given an array prices where prices[i] is the price on day i,
-# return the maximum profit from a single buy then sell.
-#
-# Example: prices = [7,1,5,3,6,4] → 5`,
-  },
-];
 
 const PAST_SESSIONS = [
   { id: 1, problem: "Two Sum", difficulty: "Easy" as const, tags: ["Array", "Hash Table"], date: "Mar 5, 2026", generating: false },
@@ -89,14 +44,63 @@ const Home = () => {
   const [ttsLoading, setTtsLoading] = useState(false);
   const [ttsError, setTtsError] = useState("");
   const [ttsSuccess, setTtsSuccess] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordedAudio, setRecordedAudio] = useState<string | null>(null);
+  const [problems, setProblems] = useState<Problem[]>([]);
+  const [loadingProblems, setLoadingProblems] = useState(true);
+  const [isFluxActive, setIsFluxActive] = useState(false);
+  const [fluxError, setFluxError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isLoading && !user) {
       navigate("/");
     }
   }, [user, isLoading, navigate]);
+
+  // Fetch problems from Supabase
+  useEffect(() => {
+    const fetchProblems = async () => {
+      try {
+        const { data, error} = await supabase
+          .from('questions')
+          .select('*')
+          .order('created_at', { ascending: true });
+
+        if (error) throw error;
+
+        setProblems(data || []);
+      } catch (error) {
+        console.error('Error fetching problems:', error);
+      } finally {
+        setLoadingProblems(false);
+      }
+    };
+
+    fetchProblems();
+  }, []);
+
+  // Listen for TTS audio from Rust
+  useEffect(() => {
+    const unlisten = listen<string>('tts-response', (event) => {
+      const base64Audio = event.payload;
+      console.log('🔊 Received TTS audio from Rust');
+
+      // Convert base64 to audio and play
+      const audioBytes = Uint8Array.from(atob(base64Audio), c => c.charCodeAt(0));
+      const audioBlob = new Blob([audioBytes], { type: 'audio/mpeg' });
+      const audioUrl = URL.createObjectURL(audioBlob);
+
+      const audio = new Audio(audioUrl);
+      audio.play();
+
+      audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+        console.log('🏁 Audio playback complete');
+      };
+    });
+
+    return () => {
+      unlisten.then(fn => fn());
+    };
+  }, []);
 
   const handleLogout = () => {
     logout();
@@ -160,44 +164,23 @@ const Home = () => {
     }
   };
 
-  const handleStartRecording = async () => {
-    console.log("🎤 Starting mic recording...");
+  const handleToggleFlux = async () => {
     try {
-      await invoke("start_recording");
-      setIsRecording(true);
-      console.log("✅ Recording started");
+      setFluxError(null);
+      if (isFluxActive) {
+        await invoke("stop_flux_agent");
+        setIsFluxActive(false);
+        console.log("✅ Flux agent stopped");
+      } else {
+        await invoke("start_flux_agent");
+        setIsFluxActive(true);
+        console.log("✅ Flux agent started");
+      }
     } catch (error) {
-      console.error("❌ Failed to start recording:", error);
+      console.error("❌ Flux agent error:", error);
+      setFluxError(error as string);
+      setIsFluxActive(false);
     }
-  };
-
-  const handleStopRecording = async () => {
-    console.log("🛑 Stopping mic recording...");
-    try {
-      const base64Audio = await invoke<string>("stop_recording");
-      setRecordedAudio(base64Audio);
-      setIsRecording(false);
-      console.log("✅ Recording stopped, audio saved");
-    } catch (error) {
-      console.error("❌ Failed to stop recording:", error);
-    }
-  };
-
-  const handlePlayRecording = () => {
-    if (!recordedAudio) return;
-
-    console.log("🎧 Playing recorded audio...");
-    const audioBytes = Uint8Array.from(atob(recordedAudio), c => c.charCodeAt(0));
-    const audioBlob = new Blob([audioBytes], { type: 'audio/wav' });
-    const audioUrl = URL.createObjectURL(audioBlob);
-
-    const audio = new Audio(audioUrl);
-    audio.play();
-
-    audio.onended = () => {
-      URL.revokeObjectURL(audioUrl);
-      console.log("🏁 Playback complete");
-    };
   };
 
 
@@ -393,7 +376,9 @@ const Home = () => {
 
   const getDifficultyStyles = (difficulty: string) => {
     const base = "inline-block px-3 py-1 rounded-md text-[11px] font-bold uppercase tracking-wider";
-    switch (difficulty) {
+    // Normalize difficulty (trim whitespace and capitalize first letter)
+    const normalized = difficulty?.trim();
+    switch (normalized) {
       case "Easy":
         return `${base} text-green-400 bg-green-400/10`;
       case "Medium":
@@ -500,48 +485,55 @@ const Home = () => {
                 )}
               </div>
 
-              {/* Mic Test */}
+              {/* Voice Agent Test */}
               <div className="mt-8 p-6 bg-[#13131f] border border-[#1a1a28] rounded-xl">
-                <h3 className="text-lg font-semibold text-white mb-4">Microphone Test</h3>
+                <h3 className="text-lg font-semibold text-white mb-4">Voice Agent (Deepgram Flux + Claude)</h3>
 
                 <div className="space-y-4">
-                  {/* Control Buttons */}
-                  <div className="flex gap-3">
-                    <button
-                      onClick={isRecording ? handleStopRecording : handleStartRecording}
-                      className={`flex items-center gap-2 px-6 py-3 rounded-lg text-sm font-semibold transition-all ${
-                        isRecording
-                          ? "bg-red-500 hover:bg-red-600 text-white"
-                          : "bg-[#7c6aff] hover:bg-[#6b59e6] text-white"
-                      }`}
-                    >
-                      {isRecording ? (
-                        <>
-                          <MicOff size={18} />
-                          <span>Stop Recording</span>
-                        </>
-                      ) : (
-                        <>
-                          <Mic size={18} />
-                          <span>Start Recording</span>
-                        </>
-                      )}
-                    </button>
+                  {/* Control Button */}
+                  <button
+                    onClick={handleToggleFlux}
+                    className={`flex items-center gap-2 px-6 py-3 rounded-lg text-sm font-semibold transition-all ${
+                      isFluxActive
+                        ? "bg-red-500 hover:bg-red-600 text-white"
+                        : "bg-[#7c6aff] hover:bg-[#6b59e6] text-white"
+                    }`}
+                  >
+                    {isFluxActive ? (
+                      <>
+                        <MicOff size={18} />
+                        <span>Stop Agent</span>
+                      </>
+                    ) : (
+                      <>
+                        <Mic size={18} />
+                        <span>Start Agent</span>
+                      </>
+                    )}
+                  </button>
 
-                    {recordedAudio && !isRecording && (
-                      <button
-                        onClick={handlePlayRecording}
-                        className="flex items-center gap-2 px-6 py-3 bg-green-500 hover:bg-green-600 text-white rounded-lg text-sm font-semibold transition-all"
-                      >
-                        <Play size={18} />
-                        <span>Play Recording</span>
-                      </button>
+                  {/* Status */}
+                  <div className="text-sm">
+                    {isFluxActive ? (
+                      <span className="text-green-400">🎤 Agent Running - Speak to interact</span>
+                    ) : (
+                      <span className="text-gray-400">⚪ Agent Stopped</span>
                     )}
                   </div>
 
-                  {/* Status */}
-                  <div className="text-sm text-gray-400">
-                    {isRecording ? "🔴 Recording..." : recordedAudio ? "✅ Recording saved - click Play to listen" : "⚪ No recording"}
+                  {/* Error */}
+                  {fluxError && (
+                    <div className="p-4 bg-red-400/10 border border-red-400/20 rounded-lg">
+                      <p className="text-sm font-semibold text-red-400 mb-1">Error:</p>
+                      <p className="text-red-300 text-sm">{fluxError}</p>
+                    </div>
+                  )}
+
+                  {/* Instructions */}
+                  <div className="p-4 bg-blue-400/10 border border-blue-400/20 rounded-lg">
+                    <p className="text-sm text-blue-300">
+                      Click "Start Agent" and speak. The agent will listen, send your speech to Claude, and respond with voice. Check the terminal for detailed logs.
+                    </p>
                   </div>
                 </div>
               </div>
@@ -549,52 +541,41 @@ const Home = () => {
 
             {/* Problem Cards */}
             <section className="flex flex-col gap-4">
-              {PROBLEMS.map((problem) => (
-                <div key={problem.id} className="flex justify-between items-start px-7 py-6 bg-[#13131f] border border-[#1a1a28] rounded-xl hover:border-[#2a2a38] transition-colors">
-                  <div className="flex flex-col gap-3.5 flex-1">
-                    <div className="flex items-center gap-3">
-                      <span className={getDifficultyStyles(problem.difficulty)}>
-                        {problem.difficulty}
-                      </span>
-                      <h3 className="text-lg font-semibold text-white">{problem.name}</h3>
-                    </div>
-                    <div className="flex gap-2.5 flex-wrap">
-                      {problem.tags.map((tag, i) => (
-                        <span key={i} className="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 bg-white/5">
-                          {tag}
+              {loadingProblems ? (
+                <div className="flex items-center justify-center py-20">
+                  <Loader2 size={48} className="text-[#7c6aff] animate-spin" />
+                </div>
+              ) : problems.length === 0 ? (
+                <div className="text-center py-20 text-gray-400">
+                  <p>No problems available yet.</p>
+                </div>
+              ) : (
+                problems.map((problem) => (
+                  <div key={problem.id} className="flex justify-between items-start px-7 py-6 bg-[#13131f] border border-[#1a1a28] rounded-xl hover:border-[#2a2a38] transition-colors">
+                    <div className="flex flex-col gap-3.5 flex-1">
+                      <div className="flex items-center gap-3">
+                        <span className={getDifficultyStyles(problem.difficulty)}>
+                          {problem.difficulty}
                         </span>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="flex flex-col items-end gap-3 ml-6">
-                    {problem.practiced ? (
-                      <>
-                        <span className="text-sm text-gray-400 whitespace-nowrap">
-                          Practiced on {problem.practicedDate}
+                        <h3 className="text-lg font-semibold text-white">{problem.title}</h3>
+                      </div>
+                      <div className="flex gap-2.5 flex-wrap">
+                        <span className="px-3 py-1.5 rounded-md text-xs font-medium text-gray-400 bg-white/5">
+                          {problem.category}
                         </span>
-                        <div className="flex gap-2.5">
-                          <button className="px-5 py-2.5 bg-transparent text-gray-400 border border-[#2a2a38] rounded-lg text-sm font-medium hover:border-[#3e3e42] hover:text-gray-300 transition-all whitespace-nowrap">
-                            Check Result
-                          </button>
-                          <button
-                            className="px-5 py-2.5 bg-transparent text-[#7c6aff] border border-[#7c6aff] rounded-lg text-sm font-semibold hover:bg-[#7c6aff] hover:text-white transition-all whitespace-nowrap"
-                            onClick={() => navigate("/session", { state: { prompt: problem.prompt } })}
-                          >
-                            Practice Again
-                          </button>
-                        </div>
-                      </>
-                    ) : (
+                      </div>
+                    </div>
+                    <div className="flex flex-col items-end gap-3 ml-6">
                       <button
                         className="px-6 py-3 bg-[#7c6aff] text-white rounded-lg text-[15px] font-semibold hover:bg-[#6b59e6] hover:-translate-y-0.5 transition-all whitespace-nowrap"
-                        onClick={() => navigate("/session", { state: { prompt: problem.prompt } })}
+                        onClick={() => navigate("/session", { state: { question: problem } })}
                       >
                         Start Mock Interview
                       </button>
-                    )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                ))
+              )}
             </section>
           </div>
         );

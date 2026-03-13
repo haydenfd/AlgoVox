@@ -1,9 +1,11 @@
 use std::thread;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{Emitter, Manager};
 use serde::{Deserialize, Serialize};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use tokio::sync::mpsc;
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tauri::Emitter;
 
 #[derive(Serialize)]
 struct DeepgramRequest {
@@ -145,225 +147,345 @@ async fn test_tts() -> Result<String, String> {
     Ok(base64_audio)
 }
 
-// Global state for recording
-static RECORDING: AtomicBool = AtomicBool::new(false);
-lazy_static::lazy_static! {
-    static ref AUDIO_BUFFER: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    static ref SAMPLE_RATE: Arc<Mutex<u32>> = Arc::new(Mutex::new(44100));
+// Global state for Flux agent
+static FLUX_RUNNING: AtomicBool = AtomicBool::new(false);
+static AUDIO_CALLBACK_TRIGGERED: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+async fn start_flux_agent(app_handle: tauri::AppHandle) -> Result<(), String> {
+    println!("🚀 [Rust] start_flux_agent command invoked");
+
+    if FLUX_RUNNING.load(Ordering::SeqCst) {
+        return Err("Flux agent already running".to_string());
+    }
+
+    // Try loading .env from parent directory (project root)
+    let env_path = std::env::current_dir()
+        .map_err(|e| format!("Failed to get current dir: {}", e))?
+        .parent()
+        .ok_or("No parent directory")?
+        .join(".env");
+
+    println!("🔍 [Rust] Looking for .env at: {:?}", env_path);
+    dotenvy::from_path(&env_path).ok();
+
+    let api_key_deepgram = std::env::var("DEEPGRAM_API_KEY")
+        .map_err(|_| "DEEPGRAM_API_KEY not found in .env".to_string())?;
+
+    let api_key_claude = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| "ANTHROPIC_API_KEY not found in .env".to_string())?;
+
+    FLUX_RUNNING.store(true, Ordering::SeqCst);
+
+    // Spawn the flux loop in a background task
+    tokio::spawn(async move {
+        if let Err(e) = run_flux_loop(app_handle, api_key_deepgram, api_key_claude).await {
+            eprintln!("❌ Flux loop error: {}", e);
+        }
+        FLUX_RUNNING.store(false, Ordering::SeqCst);
+    });
+
+    Ok(())
 }
 
 #[tauri::command]
-async fn start_recording() -> Result<(), String> {
-    println!("🎤 [Rust] start_recording command invoked");
+fn stop_flux_agent() -> Result<(), String> {
+    println!("🛑 [Rust] stop_flux_agent command invoked");
+    FLUX_RUNNING.store(false, Ordering::SeqCst);
+    Ok(())
+}
 
-    if RECORDING.load(Ordering::SeqCst) {
-        return Err("Already recording".to_string());
-    }
+async fn run_flux_loop(
+    app_handle: tauri::AppHandle,
+    api_key_deepgram: String,
+    api_key_claude: String,
+) -> Result<(), String> {
+    println!("🎤 Starting Flux agent loop...");
+    println!("🔑 Deepgram key length: {}", api_key_deepgram.len());
+    println!("🔑 Claude key length: {}", api_key_claude.len());
 
-    // Clear previous recording
-    {
-        let mut buffer = AUDIO_BUFFER.lock().unwrap();
-        buffer.clear();
-    }
+    // Build WebSocket URL for Deepgram Flux
+    let ws_url = "wss://api.deepgram.com/v1/listen?model=flux-general-en&encoding=linear16&sample_rate=16000&channels=1";
+    println!("🌐 Connecting to: {}", ws_url);
 
-    RECORDING.store(true, Ordering::SeqCst);
+    // Create WebSocket connection with auth header
+    let request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(ws_url)
+        .header("Authorization", format!("Token {}", api_key_deepgram))
+        .body(())
+        .map_err(|e| {
+            eprintln!("❌ Failed to build WS request: {}", e);
+            format!("Failed to build WS request: {}", e)
+        })?;
 
+    println!("📡 Attempting WebSocket connection...");
+    let (ws_stream, response) = connect_async(request)
+        .await
+        .map_err(|e| {
+            eprintln!("❌ WebSocket connection failed: {}", e);
+            format!("Failed to connect to Deepgram: {}", e)
+        })?;
+
+    println!("✅ Connected to Deepgram Flux - Status: {:?}", response.status());
+
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+    // Channel for audio data
+    let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(100);
+
+    // Spawn audio capture thread
+    let audio_tx_clone = audio_tx.clone();
     thread::spawn(move || {
-        let host = cpal::default_host();
-        let device = match host.default_input_device() {
-            Some(d) => d,
-            None => {
-                eprintln!("🎤 [Rust] No input device available");
-                RECORDING.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-
-        println!("🎤 [Rust] Using input device: {}", device.name().unwrap_or_default());
-
-        let config = match device.default_input_config() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("🎤 [Rust] Failed to get config: {}", e);
-                RECORDING.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-
-        // Store sample rate
-        {
-            let mut sr = SAMPLE_RATE.lock().unwrap();
-            *sr = config.sample_rate().0;
+        println!("🎤 Audio capture thread started");
+        if let Err(e) = capture_audio_for_flux(audio_tx_clone) {
+            eprintln!("Audio capture error: {}", e);
         }
+    });
 
-        println!("🎤 [Rust] Input config: {:?}", config);
+    // Spawn task to send audio to WebSocket
+    let mut audio_count = 0;
+    tokio::spawn(async move {
+        while let Some(audio_data) = audio_rx.recv().await {
+            if !FLUX_RUNNING.load(Ordering::SeqCst) {
+                break;
+            }
+            audio_count += 1;
+            if audio_count % 100 == 0 {
+                println!("🔊 Sent {} audio chunks to Deepgram", audio_count);
+            }
+            if ws_sender.send(Message::Binary(audio_data)).await.is_err() {
+                eprintln!("❌ Failed to send audio to WebSocket");
+                break;
+            }
+        }
+    });
 
-        let err_fn = |err| eprintln!("🎤 [Rust] Stream error: {}", err);
+    // Listen for transcripts from Deepgram
+    while FLUX_RUNNING.load(Ordering::SeqCst) {
+        match ws_receiver.next().await {
+            Some(Ok(Message::Text(text))) => {
+                println!("📨 Deepgram message: {}", text); // Debug: show all messages
 
-        let buffer_clone = AUDIO_BUFFER.clone();
+                // Parse Deepgram response
+                if let Ok(response) = serde_json::from_str::<serde_json::Value>(&text) {
+                    // Check for EndOfTurn event with transcript
+                    if response["speech_final"].as_bool() == Some(true)
+                        && response["is_final"].as_bool() == Some(true)
+                    {
+                        if let Some(transcript) = response["channel"]["alternatives"][0]["transcript"].as_str() {
+                            if !transcript.trim().is_empty() {
+                                println!("📝 User said: {}", transcript);
 
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                &config.into(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if !RECORDING.load(Ordering::SeqCst) {
-                        return;
+                                // Call Claude API
+                                match call_claude_api(&api_key_claude, transcript).await {
+                                    Ok(claude_response) => {
+                                        println!("🤖 Claude responds: {}", claude_response);
+
+                                        // Call Deepgram TTS
+                                        match call_deepgram_tts(&api_key_deepgram, &claude_response).await {
+                                            Ok(audio_base64) => {
+                                                // Emit audio to React via Tauri event
+                                                let _ = app_handle.emit("tts-response", audio_base64);
+                                                println!("🔊 TTS audio sent to frontend");
+                                            }
+                                            Err(e) => eprintln!("TTS error: {}", e),
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Claude error: {}", e),
+                                }
+                            }
+                        }
                     }
-                    let mut buffer = buffer_clone.lock().unwrap();
-                    buffer.extend_from_slice(data);
-                },
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::I16 => device.build_input_stream(
+                }
+            }
+            Some(Ok(_)) => {} // Ignore other message types
+            Some(Err(e)) => {
+                eprintln!("WebSocket error: {}", e);
+                break;
+            }
+            None => break,
+        }
+    }
+
+    println!("✅ Flux agent loop stopped");
+    Ok(())
+}
+
+fn capture_audio_for_flux(tx: mpsc::Sender<Vec<u8>>) -> Result<(), String> {
+    println!("🎙️ Initializing audio capture...");
+
+    let host = cpal::default_host();
+    println!("🎙️ Got audio host");
+
+    let device = host.default_input_device()
+        .ok_or_else(|| {
+            eprintln!("❌ No input device available");
+            "No input device available".to_string()
+        })?;
+
+    println!("🎙️ Got input device: {:?}", device.name());
+
+    let config = device.default_input_config()
+        .map_err(|e| {
+            eprintln!("❌ Failed to get config: {}", e);
+            format!("Failed to get config: {}", e)
+        })?;
+
+    println!("🎤 Audio config - Sample rate: {}, Channels: {}, Format: {:?}",
+        config.sample_rate().0, config.channels(), config.sample_format());
+
+    // Reset the callback trigger flag
+    AUDIO_CALLBACK_TRIGGERED.store(false, Ordering::SeqCst);
+
+    // Build stream based on sample format
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::I16 => {
+            println!("🎤 Using I16 sample format");
+            device.build_input_stream(
                 &config.into(),
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    if !RECORDING.load(Ordering::SeqCst) {
+                    if !FLUX_RUNNING.load(Ordering::SeqCst) {
                         return;
                     }
-                    let mut buffer = buffer_clone.lock().unwrap();
-                    // Convert i16 to f32
-                    for &sample in data {
-                        buffer.push(sample as f32 / i16::MAX as f32);
+                    // Log only the first callback
+                    if !AUDIO_CALLBACK_TRIGGERED.swap(true, Ordering::SeqCst) {
+                        println!("🎤 First I16 audio callback! Got {} samples", data.len());
                     }
+                    // Convert i16 samples to bytes (little-endian linear16)
+                    let bytes: Vec<u8> = data
+                        .iter()
+                        .flat_map(|&sample| sample.to_le_bytes().to_vec())
+                        .collect();
+                    let _ = tx.try_send(bytes);
                 },
-                err_fn,
+                |err| eprintln!("Stream error: {}", err),
                 None,
-            ),
-            _ => {
-                eprintln!("🎤 [Rust] Unsupported sample format");
-                RECORDING.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-
-        match stream {
-            Ok(stream) => {
-                println!("🎤 [Rust] Starting audio stream...");
-                if let Err(e) = stream.play() {
-                    eprintln!("🎤 [Rust] Failed to play stream: {}", e);
-                    RECORDING.store(false, Ordering::SeqCst);
-                    return;
-                }
-
-                println!("✅ [Rust] Recording started");
-
-                // Keep stream alive while recording
-                while RECORDING.load(Ordering::SeqCst) {
-                    thread::sleep(std::time::Duration::from_millis(100));
-                }
-
-                println!("🎤 [Rust] Stopping recording...");
-                drop(stream);
-                println!("✅ [Rust] Recording stopped");
-            }
-            Err(e) => {
-                eprintln!("🎤 [Rust] Failed to build input stream: {}", e);
-                RECORDING.store(false, Ordering::SeqCst);
-            }
+            )
+        },
+        cpal::SampleFormat::F32 => {
+            println!("🎤 Using F32 sample format");
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    if !FLUX_RUNNING.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    // Log only the first callback
+                    if !AUDIO_CALLBACK_TRIGGERED.swap(true, Ordering::SeqCst) {
+                        println!("🎤 First F32 audio callback! Got {} samples", data.len());
+                    }
+                    // Convert f32 to i16 then to bytes
+                    let bytes: Vec<u8> = data
+                        .iter()
+                        .map(|&sample| (sample * i16::MAX as f32) as i16)
+                        .flat_map(|sample| sample.to_le_bytes().to_vec())
+                        .collect();
+                    let _ = tx.try_send(bytes);
+                },
+                |err| eprintln!("Stream error: {}", err),
+                None,
+            )
+        },
+        _ => {
+            eprintln!("❌ Unsupported sample format: {:?}", config.sample_format());
+            return Err("Unsupported sample format".to_string());
         }
-    });
+    }
+    .map_err(|e| {
+        eprintln!("❌ Failed to build stream: {}", e);
+        format!("Failed to build stream: {}", e)
+    })?;
 
+    stream.play().map_err(|e| {
+        eprintln!("❌ Failed to play stream: {}", e);
+        format!("Failed to play stream: {}", e)
+    })?;
+
+    println!("✅ Audio stream started - listening for audio...");
+
+    // Keep stream alive
+    while FLUX_RUNNING.load(Ordering::SeqCst) {
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    println!("🛑 Audio capture stopped");
     Ok(())
 }
 
-#[tauri::command]
-fn stop_recording() -> Result<String, String> {
-    println!("🛑 [Rust] stop_recording command invoked");
-    RECORDING.store(false, Ordering::SeqCst);
+async fn call_claude_api(api_key: &str, user_message: &str) -> Result<String, String> {
+    let client = reqwest::Client::new();
 
-    // Wait a bit for the stream to finish
-    thread::sleep(std::time::Duration::from_millis(200));
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "system": "You are a helpful assistant. Keep responses concise and conversational.",
+        "messages": [{
+            "role": "user",
+            "content": user_message
+        }]
+    });
 
-    // Get the recorded audio
-    let buffer = AUDIO_BUFFER.lock().unwrap();
-    let sample_rate = *SAMPLE_RATE.lock().unwrap();
+    let response = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("Content-Type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Claude request failed: {}", e))?;
 
-    if buffer.is_empty() {
-        return Err("No audio recorded".to_string());
+    if !response.status().is_success() {
+        return Err(format!("Claude API error: {}", response.status()));
     }
 
-    println!("🎵 [Rust] Encoding {} samples at {} Hz", buffer.len(), sample_rate);
+    let data: serde_json::Value = response.json().await
+        .map_err(|e| format!("Failed to parse Claude response: {}", e))?;
 
-    // Encode to WAV
-    let mut wav_data = Vec::new();
-    {
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
+    let text = data["content"][0]["text"].as_str()
+        .ok_or("No text in Claude response")?;
 
-        let mut writer = hound::WavWriter::new(std::io::Cursor::new(&mut wav_data), spec)
-            .map_err(|e| format!("Failed to create WAV writer: {}", e))?;
+    Ok(text.to_string())
+}
 
-        for &sample in buffer.iter() {
-            let sample_i16 = (sample * i16::MAX as f32) as i16;
-            writer.write_sample(sample_i16)
-                .map_err(|e| format!("Failed to write sample: {}", e))?;
-        }
+async fn call_deepgram_tts(api_key: &str, text: &str) -> Result<String, String> {
+    let client = reqwest::Client::new();
 
-        writer.finalize()
-            .map_err(|e| format!("Failed to finalize WAV: {}", e))?;
+    let body = serde_json::json!({
+        "text": text
+    });
+
+    let response = client
+        .post("https://api.deepgram.com/v1/speak?model=aura-asteria-en")
+        .header("Authorization", format!("Token {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("TTS request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("TTS API error: {}", response.status()));
     }
 
-    println!("✅ [Rust] WAV encoded: {} bytes", wav_data.len());
+    let audio_bytes = response.bytes().await
+        .map_err(|e| format!("Failed to read audio: {}", e))?;
 
-    // Convert to base64
-    let base64_audio = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &wav_data);
+    let base64_audio = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &audio_bytes);
 
     Ok(base64_audio)
-}
-
-#[tauri::command]
-async fn start_oauth_listener(app_handle: tauri::AppHandle) -> Result<(), String> {
-    thread::spawn(move || {
-        let server = tiny_http::Server::http("127.0.0.1:8080")
-            .map_err(|e| format!("Failed to start server: {}", e))
-            .unwrap();
-
-        // Wait for one request (the OAuth callback)
-        if let Ok(request) = server.recv() {
-            let url = request.url().to_string();
-
-            // Send a simple HTML response
-            let response = tiny_http::Response::from_string(
-                r#"<!DOCTYPE html>
-                <html>
-                <head><title>Sign In Successful</title></head>
-                <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-                    <h1>Sign in successful!</h1>
-                    <p>You can close this window and return to AlgoVox.</p>
-                    <script>setTimeout(() => window.close(), 2000);</script>
-                </body>
-                </html>"#
-            ).with_header(
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap()
-            );
-
-            let _ = request.respond(response);
-
-            // Emit the URL to the frontend
-            let _ = app_handle.emit("oauth-callback", url);
-        }
-    });
-
-    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_http::init())
+        .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
-            start_oauth_listener,
             test_stt,
             test_tts,
-            start_recording,
-            stop_recording
+            start_flux_agent,
+            stop_flux_agent
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

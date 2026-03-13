@@ -70,9 +70,9 @@ A local voice-powered AI interviewer for algorithm and coding practice. Built wi
 - **tokio** - Async runtime
 
 ### APIs & Services
+- **Supabase** - Authentication (Google & GitHub OAuth)
 - **Deepgram** - Speech-to-Text & Text-to-Speech
 - **Anthropic Claude** - AI interviewer intelligence
-- **GitHub/Google OAuth** - Authentication
 
 ---
 
@@ -134,10 +134,10 @@ algovox/
 
    Edit `.env` and add your API keys:
    ```env
+   VITE_SUPABASE_URL=your_supabase_project_url
+   VITE_SUPABASE_ANON_KEY=your_supabase_anon_key
    DEEPGRAM_API_KEY=your_deepgram_key
    ANTHROPIC_API_KEY=your_anthropic_key
-   VITE_GOOGLE_CLIENT_ID=your_google_client_id
-   VITE_GOOGLE_CLIENT_SECRET=your_google_secret
    ```
 
 4. **Run the development server:**
@@ -151,12 +151,14 @@ algovox/
 
 ### Authentication Flow
 1. User clicks "Sign in with GitHub" or "Sign in with Google"
-2. Tauri spawns local HTTP server on `localhost:8080`
-3. Opens OAuth provider in system browser
-4. Provider redirects to `localhost:8080/callback` with auth code
-5. Rust backend exchanges code for tokens
-6. Frontend stores session in localStorage
+2. Supabase JS SDK initiates OAuth flow
+3. Opens OAuth provider in system browser (via tauri-plugin-shell)
+4. Provider authenticates user and redirects back to app
+5. Supabase handles token exchange and session management
+6. Auth state listener in AuthContext detects session
 7. User is redirected to `/home`
+
+**Note:** Authentication is handled entirely by Supabase. No custom OAuth server needed.
 
 ### Interview Session Flow
 1. User selects a problem from the dashboard

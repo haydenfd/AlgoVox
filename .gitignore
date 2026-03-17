@@ -17,6 +17,11 @@ node_modules
 # Build outputs
 dist
 dist-ssr
+dist-electron
+out
+
+# TypeScript
+*.tsbuildinfo
 
 # IDE
 .vscode/*
@@ -29,6 +34,5 @@ dist-ssr
 *.sln
 *.sw?
 
-# Tauri
-src-tauri/target/
-src-tauri/gen/schemas
+# Electron
+release

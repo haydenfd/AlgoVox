@@ -1,8 +1,14 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { PlayCircle, FileText, Loader2 } from "lucide-react";
+import { PlayCircle, FileText, Loader2, Mic } from "lucide-react";
 
-type NavItem = "practice" | "transcripts";
+type NavItem = "practice" | "transcripts" | "mic-test";
+
+interface Turn {
+  userText: string;
+  agentText: string | null;
+  isThinking: boolean;
+}
 
 interface Problem {
   id: number;
@@ -79,6 +85,99 @@ const SESSIONS: Session[] = [
 function Home() {
   const navigate = useNavigate();
   const [activeNav, setActiveNav] = useState<NavItem>("practice");
+
+  // Voice loop state
+  const [isListening, setIsListening] = useState(false);
+  const [interim, setInterim] = useState("");
+  const [turns, setTurns] = useState<Turn[]>([]);
+  const [transcriptionError, setTranscriptionError] = useState("");
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!window.electron) {
+      setTranscriptionError("Electron API not available. Make sure the app is running in Electron.");
+      console.error("window.electron is not available");
+      return;
+    }
+
+    window.electron.onTranscript((type, text) => {
+      if (!text.trim()) return;
+      if (type === "interim") {
+        setInterim(text);
+      } else {
+        // final — start a new turn
+        setInterim("");
+        setTurns(prev => [...prev, { userText: text, agentText: null, isThinking: true }]);
+      }
+    });
+
+    window.electron.onAgentThinking(() => {
+      // already handled by isThinking flag in turn
+    });
+
+    window.electron.onAgentResponse((text) => {
+      setTurns(prev => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        if (last) last.agentText = text;
+        return updated;
+      });
+    });
+
+    window.electron.onTTSAudio(async (base64) => {
+      // Decode and play audio
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type: "audio/wav" });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        window.electron.playbackDone();
+
+        // Mark thinking done
+        setTurns(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last) last.isThinking = false;
+          return updated;
+        });
+      };
+      audio.play();
+    });
+
+    window.electron.onConnectionClosed(() => {
+      console.log("Connection closed by server");
+      setIsListening(false);
+      setInterim("");
+    });
+  }, []);
+
+  useEffect(() => {
+    if (activeNav === "mic-test") {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [turns, interim, activeNav]);
+
+  const toggleListening = async () => {
+    if (!window.electron) {
+      console.error("window.electron is not available");
+      return;
+    }
+
+    if (isListening) {
+      await window.electron.stopListening();
+      setIsListening(false);
+      setInterim("");
+    } else {
+      setTurns([]);
+      await window.electron.startListening();
+      setIsListening(true);
+    }
+  };
 
   const getDifficultyColor = (difficulty: string) => {
     switch (difficulty) {
@@ -182,6 +281,63 @@ function Home() {
             </div>
           </div>
         );
+      case "mic-test":
+        return (
+          <div className="max-w-4xl w-full flex flex-col">
+            <h1 className="text-4xl font-bold text-white mb-4">Voice Loop Test</h1>
+            <p className="text-lg text-neutral-400 mb-8">
+              Speak → Claude responds → TTS plays → mic reopens
+            </p>
+
+            {transcriptionError && (
+              <div className="mb-6 p-4 bg-red-900 border border-red-600 rounded-lg text-red-200">
+                {transcriptionError}
+              </div>
+            )}
+
+            <button
+              onClick={toggleListening}
+              className={`w-fit px-6 py-3 rounded-lg font-semibold transition-colors mb-8 ${
+                isListening
+                  ? "bg-red-600 hover:bg-red-700 text-white"
+                  : "bg-purple-600 hover:bg-purple-700 text-white"
+              }`}
+            >
+              {isListening ? "⏹ Stop" : "🎤 Begin Listening"}
+            </button>
+
+            <div className="flex flex-col gap-4">
+              {turns.map((turn, i) => (
+                <div key={i} className="flex flex-col gap-2">
+                  {/* User turn */}
+                  <div className="bg-neutral-800 rounded-lg p-4">
+                    <p className="text-xs text-neutral-500 uppercase tracking-wide mb-1">You</p>
+                    <p className="text-white">{turn.userText}</p>
+                  </div>
+                  {/* Agent turn */}
+                  <div className="bg-neutral-700 rounded-lg p-4">
+                    <p className="text-xs text-neutral-500 uppercase tracking-wide mb-1">AlgoVox</p>
+                    {turn.isThinking && !turn.agentText ? (
+                      <p className="text-neutral-400 italic animate-pulse">Thinking...</p>
+                    ) : (
+                      <p className="text-green-400">{turn.agentText}</p>
+                    )}
+                  </div>
+                </div>
+              ))}
+
+              {/* Live interim */}
+              {interim && (
+                <div className="bg-neutral-800 rounded-lg p-4 border border-neutral-600">
+                  <p className="text-xs text-neutral-500 uppercase tracking-wide mb-1">You</p>
+                  <p className="text-neutral-300 italic">{interim}</p>
+                </div>
+              )}
+
+              <div ref={bottomRef} />
+            </div>
+          </div>
+        );
     }
   };
 
@@ -216,6 +372,18 @@ function Home() {
           >
             <FileText size={20} />
             <span>Transcripts</span>
+          </button>
+
+          <button
+            className={`flex items-center gap-4 px-4 py-3 rounded-lg text-base font-medium transition-all w-full ${
+              activeNav === "mic-test"
+                ? "text-white bg-white bg-opacity-10"
+                : "text-neutral-500 hover:text-neutral-400 hover:bg-white hover:bg-opacity-5"
+            }`}
+            onClick={() => setActiveNav("mic-test")}
+          >
+            <Mic size={20} />
+            <span>Mic Test</span>
           </button>
         </nav>
       </aside>

@@ -12,6 +12,9 @@ contextBridge.exposeInMainWorld("electron", {
   },
   onAgentThinking: (cb: () => void) => ipcRenderer.on("agent-thinking", () => cb()),
   onAgentResponse: (cb: (text: string) => void) => ipcRenderer.on("agent-response", (_, text) => cb(text)),
+  onAgentToken: (cb: (token: string) => void) => ipcRenderer.on("agent-token", (_, token) => cb(token)),
+  onCodingStarted: (cb: () => void) => ipcRenderer.on("coding-started", () => cb()),
   onTTSAudio: (cb: (base64: string) => void) => ipcRenderer.on("tts-audio", (_, base64) => cb(base64)),
   playbackDone: () => ipcRenderer.invoke("playback-done"),
+  beginSession: (sessionState: any) => ipcRenderer.invoke("begin-session", sessionState),
 });

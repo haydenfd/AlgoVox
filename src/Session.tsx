@@ -20,32 +20,41 @@ interface TranscriptEntry {
   isThinking?: boolean;
 }
 
-const INITIAL_EDITOR_CONTENT = `# Valid Parentheses - Easy
-#
-# Given a string containing just the characters '(', ')', '{', '}', '[' and ']',
-# determine if the input string is valid.
-#
-# Examples:
-#   Input: "()"      → Output: true
-#   Input: "()[]{}"  → Output: true
-#   Input: "(]"      → Output: false
+function getInitialContent(lang: string): string {
+  const comment = ["javascript", "typescript", "java", "cpp"].includes(lang) ? "//" : "#";
+  return `${comment} Valid Parentheses - Easy
+${comment}
+${comment} Given a string containing just the characters '(', ')', '{', '}', '[' and ']',
+${comment} determine if the input string is valid.
+${comment}
+${comment} Examples:
+${comment}   Input: "()"      → Output: true
+${comment}   Input: "()[]{}"  → Output: true
+${comment}   Input: "(]"      → Output: false
 
-# Start coding here...
 `;
+}
 
 function Session() {
   const navigate = useNavigate();
   const location = useLocation();
   const problem = (location.state as { problem?: Problem })?.problem;
 
-  const [code, setCode] = useState(INITIAL_EDITOR_CONTENT);
+  const [language, setLanguage] = useState("python");
+  const [code, setCode] = useState(getInitialContent("python"));
   const [isPaused, setIsPaused] = useState(false);
   const [seconds, setSeconds] = useState(30 * 60); // 30 minutes in seconds
   const [transcripts, setTranscripts] = useState<TranscriptEntry[]>([]);
   const [interimText, setInterimText] = useState("");
   const [activeTab, setActiveTab] = useState<"ai" | "user">("ai");
   const [sessionState, setSessionState] = useState<SessionState | null>(null);
+  const [codingStarted, setCodingStarted] = useState(true); // force enabled for test
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+
+  const handleLanguageChange = (newLang: string) => {
+    setLanguage(newLang);
+    setCode(getInitialContent(newLang));
+  };
 
   // Timer - countdown
   useEffect(() => {
@@ -58,8 +67,8 @@ function Session() {
     return () => clearInterval(interval);
   }, [isPaused, seconds]);
 
-  // Initialize session state on mount
-  useEffect(() => {
+  // Handle session start - initialize state and trigger kickoff
+  async function handleSessionStart() {
     const state = createInitialState(HARDCODED_QUESTION);
     setSessionState(state);
 
@@ -70,19 +79,28 @@ function Session() {
     console.log("=== SYSTEM PROMPT ===");
     console.log(prompt);
     console.log("====================");
+
+    await window.electron.beginSession(state);
+  }
+
+  // Initialize session state on mount
+  useEffect(() => {
+    // TODO: Re-enable handleSessionStart after Monaco testing is complete
+    // handleSessionStart(); // temporarily disabled for testing
   }, []);
 
   // Start listening when component mounts
   useEffect(() => {
+    // TODO: Re-enable STT listening after Monaco testing is complete
     if (!window.electron) {
       console.error("window.electron is not available");
       return;
     }
 
     // Start listening immediately
-    window.electron.startListening().catch((err) => {
-      console.error("Failed to start listening:", err);
-    });
+    // window.electron.startListening().catch((err) => {
+    //   console.error("Failed to start listening:", err);
+    // }); // temporarily disabled for testing
 
     // Set up transcript listeners
     window.electron.onTranscript((type, text) => {
@@ -109,6 +127,19 @@ function Session() {
       ]);
     });
 
+    // Agent token - stream tokens in real-time
+    window.electron.onAgentToken((token) => {
+      setTranscripts((prev) => {
+        const updated = [...prev];
+        const lastEntry = updated[updated.length - 1];
+        if (lastEntry && !lastEntry.isUser) {
+          lastEntry.text += token;
+          lastEntry.isThinking = false;
+        }
+        return updated;
+      });
+    });
+
     // Agent response
     window.electron.onAgentResponse((text) => {
       setTranscripts((prev) => {
@@ -120,6 +151,12 @@ function Session() {
         }
         return updated;
       });
+    });
+
+    // Coding started
+    window.electron.onCodingStarted(() => {
+      console.log("[Session] Coding phase started, enabling editor");
+      setSessionState((prev) => prev ? { ...prev, codingStarted: true } : prev);
     });
 
     // Clean up when component unmounts
@@ -307,10 +344,37 @@ function Session() {
         </div>
 
         {/* Right Panel - Code Editor */}
-        <div className="flex-1">
+        <div className="flex-1 flex flex-col">
+          <div className="flex items-center gap-3 px-4 py-2 bg-gray-900 border-b border-gray-800">
+            <select
+              value={language}
+              onChange={(e) => handleLanguageChange(e.target.value)}
+              className="bg-gray-800 text-white rounded px-2 py-1 text-sm border border-gray-700"
+            >
+              <option value="python">Python</option>
+              <option value="javascript">JavaScript</option>
+              <option value="typescript">TypeScript</option>
+              <option value="java">Java</option>
+              <option value="cpp">C++</option>
+            </select>
+
+            <button
+              onClick={() => {
+                console.log("=== CURRENT CODE ===");
+                console.log(code);
+                console.log("=== LANGUAGE ===");
+                console.log(language);
+                console.log("====================");
+              }}
+              className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded"
+            >
+              Log Code
+            </button>
+          </div>
+
           <Editor
             height="100%"
-            defaultLanguage="python"
+            language={language}
             value={code}
             onChange={(value) => setCode(value || "")}
             theme="vs-dark"
@@ -320,7 +384,7 @@ function Session() {
               lineNumbers: "on",
               scrollBeyondLastLine: false,
               automaticLayout: true,
-              readOnly: !sessionState?.codingStarted,
+              readOnly: false,
             }}
           />
         </div>

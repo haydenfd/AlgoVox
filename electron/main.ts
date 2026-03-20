@@ -12,6 +12,81 @@ let mainWindow: BrowserWindow | null = null;
 let activeMic: any = null;
 let activeConnection: any = null;
 let aiSpeaking = false;
+let turnInProgress = false;
+let ttsChunksSent = 0;
+let ttsChunksPlayed = 0;
+let currentSystemPrompt = "";
+let conversationHistory: { role: string; content: string }[] = [];
+let currentSessionState: SessionState | null = null;
+
+// Session state types
+interface Question {
+  id: string;
+  title: string;
+  difficulty: "easy" | "medium" | "hard";
+  description: string;
+  examples: string[];
+  constraints: string[];
+}
+
+interface SessionState {
+  phase: string;
+  question: Question;
+  conversationHistory: Array<{ role: string; content: string }>;
+  hasProposedApproach: boolean;
+  codingStarted: boolean;
+  code: string;
+  startedAt: Date;
+}
+
+const BASE_PROMPT = `You are a senior software engineer conducting a technical interview at a top tech company.
+You are professional, direct, and concise.
+Never give away the solution directly.
+Respond in plain spoken English only. No markdown, no bullet points, no special characters.
+When describing the problem, speak naturally — never read special characters or symbols literally.
+Keep responses short and conversational as they will be read aloud.
+Do not use filler phrases like "great question", "good thinking", "happy to help", "certainly", or "of course".
+Respond directly and naturally like a real interviewer would, not like an AI assistant.`;
+
+const INTRO_PROMPT = `You are opening the interview.
+Start by asking if the candidate can hear you clearly.
+Once they confirm, introduce yourself briefly.
+Then give a one sentence plain English summary of the problem.
+Then say exactly: "I'll paste the full problem statement in the editor for you to follow along."
+Then walk through one example in plain spoken English — no special characters.
+Then ask if they have any clarifying questions.
+Do NOT ask them to start coding yet.`;
+
+const DISCUSSION_PROMPT = `The candidate has finished asking clarifying questions and is now in the discussion phase.
+Your job is to understand how they think before they write any code.
+Ask them to walk you through their approach at a high level.
+Ask questions like: "How would you approach this?", "What data structure are you thinking?", "Why that approach?"
+Do NOT say "let's start coding" or "ready to code" until the candidate has clearly explained a complete approach.
+Only move to coding when the candidate has explained their full approach and you are satisfied with their thinking.
+When you are ready to move to coding say exactly: "That sounds good, let's go ahead and code that up."`;
+
+const CODING_PROMPT = `The candidate is now writing their solution in the code editor.
+Stay silent unless the candidate directly asks you a question.
+Do not offer unsolicited commentary or feedback.
+If the candidate asks for help, give a small nudge only — do not give away the solution.`;
+
+function buildSystemPrompt(state: SessionState): string {
+  const questionBlock = `Current Problem:
+Title: ${state.question.title}
+Difficulty: ${state.question.difficulty}
+Description: ${state.question.description}`;
+
+  const stateBlock = `Current Interview State:
+- Phase: ${state.phase}
+- Turns so far: ${state.conversationHistory.length}`;
+
+  const stagePrompt =
+    state.phase === "intro" ? INTRO_PROMPT :
+    state.phase === "coding" ? CODING_PROMPT :
+    DISCUSSION_PROMPT;
+
+  return [BASE_PROMPT, stagePrompt, questionBlock, stateBlock].join("\n\n");
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -59,6 +134,8 @@ function reopenMic() {
     // Gate audio while AI is speaking
     if (!aiSpeaking && activeConnection) {
       activeConnection.sendMedia(chunk);
+    } else {
+      console.log("[Mic] GATED - aiSpeaking:", aiSpeaking, "hasConnection:", !!activeConnection);
     }
   });
 
@@ -84,6 +161,112 @@ async function simulateAITurn(userTranscript: string) {
 
   aiSpeaking = false;
   console.log("[AI] Turn complete, mic ungated");
+}
+
+/**
+ * Handles the session kickoff - streams Claude's opening message
+ */
+async function handleKickoff(sessionState: SessionState) {
+  console.log("[Kickoff] Starting session with state:", sessionState);
+
+  aiSpeaking = true;
+  mainWindow?.webContents.send("agent-thinking");
+
+  try {
+    console.log("[Kickoff] System prompt:", currentSystemPrompt);
+
+    const userMessage = "Please begin the interview.";
+    conversationHistory.push({ role: "user", content: userMessage });
+
+    let fullText = "";
+
+    // Stream Claude response token by token
+    // Empty user message to trigger intro from system prompt
+    for await (const token of streamClaudeResponse(
+      process.env.ANTHROPIC_API_KEY!,
+      userMessage,
+      currentSystemPrompt
+    )) {
+      fullText += token;
+      mainWindow?.webContents.send("agent-token", token);
+    }
+
+    conversationHistory.push({ role: "assistant", content: fullText });
+
+    console.log("[Kickoff] Full response:", fullText);
+    mainWindow?.webContents.send("agent-response", fullText);
+
+    // Update phase to discussion
+    if (currentSessionState) {
+      currentSessionState.phase = "discussion";
+      currentSystemPrompt = buildSystemPrompt(currentSessionState);
+      console.log("[Session] Phase updated to discussion");
+    }
+
+    aiSpeaking = false;
+    console.log("[Kickoff] Complete, mic ready for candidate response");
+  } catch (err) {
+    console.error("[Kickoff] Error:", err);
+    aiSpeaking = false;
+  }
+}
+
+/**
+ * Handles a real turn - user spoke, Claude responds (no TTS)
+ */
+async function handleRealTurn(transcript: string) {
+  if (turnInProgress) {
+    console.log("[Turn] Already in progress, ignoring");
+    return;
+  }
+  if (!transcript?.trim()) return;
+  if (transcript.trim().split(" ").length < 6) {
+    console.log("[Turn] Too short, ignoring:", transcript);
+    return;
+  }
+
+  turnInProgress = true;
+  console.log("[Turn] User said:", transcript);
+  mainWindow?.webContents.send("agent-thinking");
+
+  conversationHistory.push({ role: "user", content: transcript });
+
+  try {
+    let fullText = "";
+
+    for await (const token of streamClaudeResponse(
+      process.env.ANTHROPIC_API_KEY!,
+      transcript,
+      currentSystemPrompt,
+      conversationHistory
+    )) {
+      fullText += token;
+      mainWindow?.webContents.send("agent-token", token);
+    }
+
+    conversationHistory.push({ role: "assistant", content: fullText });
+
+    console.log("[Turn] Claude response:", fullText);
+
+    // Check for coding transition phrase
+    const CODING_TRIGGER = "let's go ahead and code that up";
+    if (fullText.toLowerCase().includes(CODING_TRIGGER)) {
+      console.log("[Session] Coding phase triggered");
+      if (currentSessionState) {
+        currentSessionState.phase = "coding";
+        currentSystemPrompt = buildSystemPrompt(currentSessionState);
+      }
+      mainWindow?.webContents.send("coding-started");
+    }
+
+    mainWindow?.webContents.send("agent-response", fullText);
+  } catch (err) {
+    console.error("[Turn] Error:", err);
+  } finally {
+    turnInProgress = false;
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    reopenMic();
+  }
 }
 
 /**
@@ -204,12 +387,15 @@ async function startDeepgramConnection() {
       // Final transcript received, but not speech_final yet
     },
     onSpeechFinal: async (text) => {
+      if (turnInProgress) return; // UtteranceEnd already handled it
       mainWindow?.webContents.send("transcript-final", text);
-      await simulateAITurn(text);
+      // await handleRealTurn(text); // temporarily disabled
     },
-    onUtteranceEnd: async (_text) => {
-      // Ignore - using speech_final only to prevent duplicates
-      console.log("[Main] UtteranceEnd ignored");
+    onUtteranceEnd: async (text) => {
+      if (!text?.trim()) return;
+      console.log("[Main] UtteranceEnd firing turn:", text);
+      mainWindow?.webContents.send("transcript-final", text);
+      // await handleRealTurn(text); // temporarily disabled
     },
     onError: (err) => {
       console.error("[Main] Deepgram error:", err);
@@ -258,10 +444,20 @@ ipcMain.handle("stop-listening", () => {
   }
   activeMic = null;
   activeConnection = null;
+  currentSystemPrompt = "";
+  conversationHistory = [];
+  currentSessionState = null;
   console.log("[Main] Stopped");
 });
 
 ipcMain.handle("playback-done", async () => {
   // TODO: Re-enable when TTS is wired up
   console.log("[Main] playback-done called (TTS not wired up yet)");
+});
+
+ipcMain.handle("begin-session", async (_, sessionState: SessionState) => {
+  console.log("[Main] begin-session called with state:", sessionState);
+  currentSessionState = sessionState;
+  currentSystemPrompt = buildSystemPrompt(sessionState);
+  await handleKickoff(sessionState);
 });

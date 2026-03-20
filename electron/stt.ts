@@ -27,8 +27,8 @@ export async function createDeepgramConnection(
     sample_rate: 16000,
     channels: 1,
     interim_results: true as any,
-    endpointing: 300,
-    utterance_end_ms: 1000,
+    endpointing: 1500,
+    utterance_end_ms: 2000,
   });
 
   let lastFinalTranscript = "";
